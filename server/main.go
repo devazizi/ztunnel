@@ -2,14 +2,20 @@ package main
 
 import (
 	"crypto/cipher"
-	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/chacha20poly1305"
-	"log"
+	"crypto/tls"
+	"flag"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
+	"ztunnel/utils/jsonlogger"
+
 	"ztunnel/utils"
 	tlsUtils "ztunnel/utils/tls"
+
+	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 type Client struct {
@@ -17,34 +23,34 @@ type Client struct {
 	Aead   cipher.AEAD
 	SeqIn  uint64
 	SeqOut uint64
-	ACL    map[string]bool // allowed local services
 }
 
 var (
+	log          = jsonlogger.EnableLogger()
 	clients      = make(map[string]*Client)
 	clientsMutex sync.Mutex
-	portBase     = 9000
+	upgrader     = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
 )
 
-func authorize(clientID, service string) bool {
-	clientsMutex.Lock()
-	defer clientsMutex.Unlock()
-	c, ok := clients[clientID]
-	if !ok {
-		return false
-	}
-	return c.ACL[service]
-}
-
-func handleClient(c *Client, clientID string) {
+// handleClient handles all messages from a client
+func handleClient(c *Client) {
 	for {
 		_, msg, err := c.Conn.ReadMessage()
 		if err != nil {
 			log.Println("Read error:", err)
 			break
 		}
+
+		if len(msg) < utils.NonceSize {
+			log.Println("Message too short")
+			continue
+		}
+
 		nonce := msg[:utils.NonceSize]
 		ct := msg[utils.NonceSize:]
+
 		pt, err := utils.Decrypt(c.Aead, c.SeqIn, nonce, ct)
 		if err != nil {
 			log.Println("Decrypt failed:", err)
@@ -52,67 +58,125 @@ func handleClient(c *Client, clientID string) {
 		}
 		c.SeqIn++
 
-		// Parse destination port (simple protocol)
-		dest := string(pt[:5]) // first 5 bytes = destination port string
-		data := pt[5:]
-
-		if !authorize(clientID, dest) {
-			log.Println("Unauthorized access attempt by", clientID, "to port", dest)
+		// First bytes: destination "host:port\n", rest: payload
+		idx := -1
+		for i := 0; i < len(pt); i++ {
+			if pt[i] == '\n' {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			log.Println("Invalid packet format")
 			continue
 		}
 
-		go forwardToLocal(dest, data, c)
+		dest := string(pt[:idx])
+		data := pt[idx+1:]
+
+		go forwardToRemote(dest, data, c)
 	}
 }
 
-func forwardToLocal(dest string, payload []byte, c *Client) {
-	conn, err := net.Dial("tcp", "127.0.0.1:"+dest)
+// forwardToRemote forwards payload to the specified remote host and sends back the response
+func forwardToRemote(dest string, payload []byte, c *Client) {
+	conn, err := net.Dial("tcp", dest)
 	if err != nil {
-		log.Println("Local connection failed:", err)
+		log.Println("Remote connection failed:", err)
 		return
 	}
 	defer conn.Close()
-	conn.Write(payload)
+
+	_, err = conn.Write(payload)
+	if err != nil {
+		log.Println("Write to remote failed:", err)
+		return
+	}
 
 	resp := make([]byte, 4096)
-	n, _ := conn.Read(resp)
-	nonce, ct, _ := utils.Encrypt(c.Aead, c.SeqOut, resp[:n])
-	c.SeqOut++
-	c.Conn.WriteMessage(websocket.BinaryMessage, append(nonce, ct...))
+	for {
+		n, err := conn.Read(resp)
+		if err != nil {
+			if err != io.EOF {
+				log.Println("Read from remote failed:", err)
+			}
+			break
+		}
+
+		nonce, ct, err := utils.Encrypt(c.Aead, c.SeqOut, resp[:n])
+		if err != nil {
+			log.Println("Encrypt failed:", err)
+			break
+		}
+		c.SeqOut++
+
+		err = c.Conn.WriteMessage(websocket.BinaryMessage, append(nonce, ct...))
+		if err != nil {
+			log.Println("Write to client failed:", err)
+			break
+		}
+	}
 }
 
 func main() {
-	tlsConfig, err := tlsUtils.LoadTLSConfig("/home/ali/Documents/development/self-projects/ztunnel/server-cert.yaml", true)
-	if err != nil {
-		panic(err.Error())
+	listen := flag.String("listen", "", "local port to listen on")
+	tlsCertificatePath := flag.String("tls-certificate-conf", "", "path to TLS certificate")
+	sharedKey := flag.String("shared-key", "", "shared key")
+	flag.Parse()
+
+	if *tlsCertificatePath == "" || *listen == "" || *sharedKey == "" {
+		log.Error("Error: --listen, --tls-certificate-conf, --shard-key are required")
+		return
 	}
 
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-
+	tlsConfig, err := tlsUtils.LoadServerTLSConfig(*tlsCertificatePath, true)
+	if err != nil {
+		panic(err)
+	}
+	tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		conn, _ := upgrader.Upgrade(w, r, nil)
 
-		// Derive AEAD key (ephemeral exchange could be added here)
-		key := make([]byte, chacha20poly1305.KeySize)
-		aead, _ := chacha20poly1305.New(key)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Println("Upgrade failed:", err)
+			return
+		}
 
-		clientID := r.Header.Get("Client-ID")
-		c := &Client{Conn: conn, Aead: aead, ACL: map[string]bool{"8080": true}}
+		if len(r.TLS.PeerCertificates) > 0 {
+			clientCert := r.TLS.PeerCertificates[0]
+			log.Println("Client Cert:", clientCert.Subject.CommonName, "SANs:", clientCert.DNSNames,
+				clientCert.IPAddresses, "Issuer:", clientCert.Issuer, "Valid:", clientCert.NotBefore, "to", clientCert.NotAfter)
+		} else {
+			fmt.Println("No client certificate provided")
+		}
+		
+		key := []byte(*sharedKey)
+		if len(key) != chacha20poly1305.KeySize {
+			log.Fatal("Key must be 32 bytes")
+		}
+
+		aead, err := chacha20poly1305.New(key)
+		if err != nil {
+			log.Println("ChaCha20 setup failed:", err)
+			conn.Close()
+			return
+		}
+
+		client := &Client{Conn: conn, Aead: aead}
+
 		clientsMutex.Lock()
-		clients[clientID] = c
+		clients[r.RemoteAddr] = client
 		clientsMutex.Unlock()
 
-		go handleClient(c, clientID)
+		log.Println("New client connected:", r.RemoteAddr)
+		go handleClient(client)
 	})
 
 	server := &http.Server{
 		Addr:      ":8443",
 		TLSConfig: tlsConfig,
-		Handler:   nil,
 	}
-	log.Println("Tunnel server listening on :8443")
-	_ = server.ListenAndServeTLS("", "") // empty strings because TLS is handled via TLSConfig
-	if err != nil {
-		log.Fatal(err)
-	}
+
+	log.Println("Server listening on :8443")
+	log.Fatal(server.ListenAndServeTLS("", ""))
 }

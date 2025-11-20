@@ -29,6 +29,7 @@ go.work.sum
 
 # Editor/IDE
  .idea/
+ .idea
  .vscode
  cert.yaml
  server-cert.yaml
