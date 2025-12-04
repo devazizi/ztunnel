@@ -28,10 +28,9 @@ go.work.sum
 .env
 
 # Editor/IDE
- .idea/
- .idea
- .vscode
- cert.yaml
- server-cert.yaml
- client-cert.yaml
+.idea/
+.vscode
+cert.yaml
+server-cert.yaml
+client-cert.yaml
 ./certs
