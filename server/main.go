@@ -144,12 +144,13 @@ func main() {
 
 		if len(r.TLS.PeerCertificates) > 0 {
 			clientCert := r.TLS.PeerCertificates[0]
-			log.Println("Client Cert:", clientCert.Subject.CommonName, "SANs:", clientCert.DNSNames,
-				clientCert.IPAddresses, "Issuer:", clientCert.Issuer, "Valid:", clientCert.NotBefore, "to", clientCert.NotAfter)
+			log.Println("Client TLS CN: ", clientCert.Subject.CommonName)
+			//log.Println("Client Cert:", clientCert.Subject.CommonName, "SANs:", clientCert.DNSNames,
+			//	clientCert.IPAddresses, "Issuer:", clientCert.Issuer, "Valid:", clientCert.NotBefore, "to", clientCert.NotAfter)
 		} else {
 			fmt.Println("No client certificate provided")
 		}
-		
+
 		key := []byte(*sharedKey)
 		if len(key) != chacha20poly1305.KeySize {
 			log.Fatal("Key must be 32 bytes")

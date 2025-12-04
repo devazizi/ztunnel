@@ -13,10 +13,59 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+/*
+           ┌────────────────────────┐
+           │   Start Client/Server  │
+           └───────────┬───────────┘
+                       │
+                       ▼
+         ┌────────────────────────────┐
+         │ Establish WebSocket Tunnel │
+         └───────────┬──────────────┘
+                     │
+                     ▼
+          ┌─────────────────────────┐
+          │ Tunnel Connected?       │
+          ├───────────┬────────────┤
+          │ Yes       │ No         │
+          ▼           ▼
+ ┌────────────────┐  ┌─────────────────────┐
+ │ Start Reading  │  │ Wait & Retry Connect│
+ │ & Writing Data │  └─────────────────────┘
+ └───────┬────────┘
+         │
+         ▼
+ ┌────────────────────────────┐
+ │ Read from Local Client     │
+ ├───────────┬────────────────┤
+ │ EOF/Error │ Normal Data    │
+ ▼           ▼
+Close Local  Encrypt + Send over Tunnel
+Connection   │
+             ▼
+   ┌─────────────────────┐
+   │ Tunnel Read Message  │
+   ├───────────┬─────────┤
+   │ Error     │ Success │
+   ▼           ▼
+Reconnect    Decrypt & Lookup connID
+Tunnel      │
+            ▼
+    Write to Local Connection
+            │
+            ▼
+       Increment Sequence
+            │
+            ▼
+      Continue Reading
+
+*/
+
 func main() {
 
 	listen := flag.String("listen", "", "local port to listen on")
 	remote := flag.String("remote", "", "remote host:port to forward to")
+	server := flag.String("server", "", "ztunnel server host:port to forward to")
 	tlsCertificatePath := flag.String("tls-certificate-conf", "", "path to TLS certificate")
 	sharedKey := flag.String("shared-key", "", "path to shared key")
 	flag.Parse()
@@ -36,9 +85,21 @@ func main() {
 	}
 
 	dialer := websocket.Dialer{TLSClientConfig: tlsConfig}
-	conn, _, err := dialer.Dial("wss://127.0.0.1:8443/ws", nil)
+	//fmt.Println(fmt.Sprintf("wss://%v/ws", *server)) // debug ztunnel server address
+	conn, _, err := dialer.Dial(fmt.Sprintf("wss://%v/ws", *server), nil)
 	if err != nil {
 		panic(err)
+	}
+	defer conn.Close()
+
+	for {
+		conn, _, err = dialer.Dial(fmt.Sprintf("wss://%v/ws", *server), nil)
+		if err != nil {
+			log.Println("WebSocket dial failed, retrying...", err)
+			continue
+		}
+		log.Println("Connected to server")
+		break
 	}
 	defer conn.Close()
 
@@ -57,7 +118,7 @@ func main() {
 		panic(err)
 	}
 	defer listener.Close()
-	log.Println("Client listening on 127.0.0.1:8080")
+	log.Println(fmt.Sprintf("Client listening on %v", *listen))
 
 	for {
 		localConn, err := listener.Accept()
