@@ -1,0 +1,12 @@
+# 5 December 2025
+1- migrate all config to yaml file instead of flags
+2- make multiple authentication method
+    - shared key
+    - username, password in static (db)
+    - username, password using ldap
+    - trust only based on client Tls certificate (actually no auth)
+
+3- TLS is expensive protect it from attackers and tls harding
+
+4- dockerize project
+5- create full setup readme
