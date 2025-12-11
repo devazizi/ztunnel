@@ -1,0 +1,31 @@
+# config of certify app to generate and manage certificates based on ldap
+# certify.yaml
+
+ldap:
+  url: "ldap://127.0.0.1:389"
+  bind_dn: "cn=admin,dc=ztunnel,dc=local"
+  bind_password: "admin"
+  base_dn: "dc=ztunnel,dc=local"
+
+organizationName: "Zero Trust Tunnel"
+
+ca:
+  root:
+    cn: "Auth Root CA"
+    validity_years: 10
+  intermediate:
+    cn: "Auth Intermediate CA"
+    validity_years: 5
+
+server_cert:
+  validity_years: 2
+  dns_sans:
+    - "ztunnel.local"
+    - "ztunnel.company.local"
+    - localhost
+  ip_sans:
+    - "10.0.0.1"
+    - 127.0.0.1
+
+client_cert:
+  validity_years: 1

@@ -12,3 +12,5 @@ go run ./server/main.go  --listen 0.0.0.0:8443  --tls-certificate-conf ./server-
 ```shell
 openssl rand -hex 16
 ```
+
+### Caution: persist certs directory

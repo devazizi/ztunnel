@@ -10,3 +10,9 @@
 
 4- dockerize project
 5- create full setup readme
+6- make rbac rules which CN or cn, org or can access route by ip address and sni and make routing policy
+7- anomaly detection like bruteforce, Distributed Denied Of Service (ddos) (Flood tunnel port with TCP packets, send malformed packets to crash your service),
+ credential stuffing, dictionary attacks, Send malformed packets, Attempt buffer overflow, Crash/generate panic in Go code, Trigger goroutine leaks or memory exhaustion,
+  Stolen client certificates, Compromised private keys, Expired/forged certificates if CA validation is weak (Attacker impersonates legitimate client inside the zero-trust context.)
+  and integration with Firewall iptables, nf_tables, Mikrotik, Pfsense, OpnSense, F5, ...
+8- (run ip transit mode, instead of point to point (in ip transit mode its like a VPN (layer 3)))
