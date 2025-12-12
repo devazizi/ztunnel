@@ -1,121 +1,82 @@
 package main
 
 import (
+	"bufio"
+	"crypto/tls"
 	"flag"
-	"fmt"
+	"io"
+	"log"
 	"net"
-	"net/http"
 	"strings"
 	"sync"
 	"ztunnel/utils/config"
 	"ztunnel/utils/jsonlogger"
 	ldapauth "ztunnel/utils/ldap_conn"
-	tlsUtils "ztunnel/utils/tls"
+	tlsconfig "ztunnel/utils/tls_helper"
 
-	"github.com/gorilla/websocket"
+	"github.com/hashicorp/yamux"
 )
 
-type Client struct {
-	Conn *websocket.Conn
-}
+var logger = jsonlogger.EnableLogger()
 
-var (
-	log          = jsonlogger.EnableLogger()
-	clients      = make(map[string]*Client)
-	clientsMutex sync.Mutex
-	upgrader     = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
-	}
-)
+func handleStream(stream net.Conn, ldapConfig ldapauth.LdapConfig) {
+	defer stream.Close()
+	reader := bufio.NewReader(stream)
 
-func handleClient(ldapConfig ldapauth.LdapConfig, c *Client, clientCertificateCommonName string) {
-	_, msg, err := c.Conn.ReadMessage()
+	// Read credentials
+	credLine, err := reader.ReadString('\n')
 	if err != nil {
-		log.Println("auth read error:", err)
-		c.Conn.Close()
+		logger.Println("read credentials error:", err)
 		return
 	}
-
-	cred := string(msg)
-	parts := strings.SplitN(cred, ":::", 2)
+	parts := strings.SplitN(strings.TrimSpace(credLine), ":::", 2)
 	if len(parts) != 2 {
-		log.Println("invalid credential format")
-		c.Conn.Close()
+		logger.Println("invalid credential format")
 		return
 	}
 	username := strings.TrimSpace(parts[0])
 	password := strings.TrimSpace(parts[1])
 
-	if clientCertificateCommonName != username {
-		log.Error("peering CN with username failed")
-		c.Conn.Close()
-		return
-	}
-
+	// LDAP authentication
 	if !ldapauth.LdapAuthenticate(ldapConfig, username, password) {
-		log.Println("LDAP auth failed")
-		c.Conn.Close()
+		logger.Println("LDAP auth failed for", username)
 		return
 	}
-	log.Println("LDAP auth OK for", username)
 
-	_, msg, err = c.Conn.ReadMessage()
+	// Read remote address
+	remoteLine, err := reader.ReadString('\n')
 	if err != nil {
-		log.Println("remote header read error:", err)
-		c.Conn.Close()
+		logger.Println("read remote address error:", err)
 		return
 	}
-
-	remoteAddr := strings.TrimSpace(string(msg))
-	log.Println("Connecting to remote:", remoteAddr)
+	remoteAddr := strings.TrimSpace(remoteLine)
+	logger.Println("Connecting to remote:", remoteAddr)
 
 	remoteConn, err := net.Dial("tcp", remoteAddr)
 	if err != nil {
-		log.Println("remote dial failed:", err)
-		c.Conn.Close()
+		logger.Println("remote dial failed:", err)
 		return
 	}
+	defer remoteConn.Close()
 
-	go relayWebsocketToTcp(c.Conn, remoteConn)
-	relayTcpToWebsocket(remoteConn, c.Conn)
-}
-
-func relayWebsocketToTcp(ws *websocket.Conn, remote net.Conn) {
-	for {
-		_, msg, err := ws.ReadMessage()
-		if err != nil {
-			remote.Close()
-			return
-		}
-
-		_, err = remote.Write(msg)
-		if err != nil {
-			ws.Close()
-			return
-		}
-	}
-}
-
-func relayTcpToWebsocket(remote net.Conn, ws *websocket.Conn) {
-	buf := make([]byte, 4096)
-	for {
-		n, err := remote.Read(buf)
-		if err != nil {
-			ws.Close()
-			return
-		}
-		ws.WriteMessage(websocket.BinaryMessage, buf[:n])
-	}
+	// Relay traffic
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(remoteConn, reader) // data from client stream to remote
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(stream, remoteConn) // data from remote to client stream
+	}()
+	wg.Wait()
 }
 
 func main() {
-	configFilePath := flag.String("config", "ztunnel-server-config.yaml", "ztunnel server config file")
-	flag.Parse()
 
-	if *configFilePath == "" {
-		flag.Usage()
-		return
-	}
+	configFilePath := flag.String("config", "ztunnel-server-config.yaml", "server config file")
+	flag.Parse()
 
 	var serverCfg config.ServerConfig
 	err := config.LoadYAMLConfig(*configFilePath, &serverCfg)
@@ -123,11 +84,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	tlsConfig, err := tlsUtils.LoadServerTLSConfig(serverCfg.TLS)
-	if err != nil {
-		panic(err)
-	}
-
+	tlsConfig, _ := tlsconfig.LoadServerTLSConfig(serverCfg.TLS)
 	ldapConfig := ldapauth.LdapConfig{
 		ServerAddress:   serverCfg.ServerConfig.LDAPServerAddress,
 		AdminDN:         serverCfg.ServerConfig.LDAPAdminDN,
@@ -136,36 +93,49 @@ func main() {
 		UserSearchField: "cn",
 	}
 
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Println("Upgrade failed:", err)
-			return
-		}
-
-		clientCert := r.TLS.PeerCertificates[0]
-		if len(r.TLS.PeerCertificates) > 0 {
-
-			log.Println("Client TLS CN:", clientCert.Subject.CommonName)
-		} else {
-			fmt.Println("No client certificate provided")
-		}
-
-		client := &Client{Conn: conn}
-
-		clientsMutex.Lock()
-		clients[r.RemoteAddr] = client
-		clientsMutex.Unlock()
-
-		log.Println(map[string]any{"IP": r.RemoteAddr})
-		go handleClient(ldapConfig, client, clientCert.Subject.CommonName)
-	})
-
-	server := &http.Server{
-		Addr:      ":8443",
-		TLSConfig: tlsConfig,
+	listener, err := tls.Listen("tcp", ":8443", tlsConfig)
+	if err != nil {
+		log.Fatal(err)
 	}
+	defer listener.Close()
+	logger.Println("Server listening on :8443")
 
-	log.Println("Server listening on :8443")
-	log.Fatal(server.ListenAndServeTLS("", ""))
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			logger.Println("accept error:", err)
+			continue
+		}
+
+		tlsConn, ok := conn.(*tls.Conn)
+		if !ok {
+			logger.Println("not a TLS connection")
+			conn.Close()
+			continue
+		}
+
+		err = tlsConn.Handshake()
+		if err != nil {
+			logger.Println("TLS handshake failed:", err)
+			conn.Close()
+			continue
+		}
+
+		go func(c net.Conn) {
+			defer c.Close()
+			session, err := yamux.Server(c, nil)
+			if err != nil {
+				logger.Println("yamux server error:", err)
+				return
+			}
+			for {
+				stream, err := session.Accept()
+				if err != nil {
+					logger.Println("yamux accept error:", err)
+					return
+				}
+				go handleStream(stream, ldapConfig)
+			}
+		}(tlsConn)
+	}
 }

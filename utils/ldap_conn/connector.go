@@ -50,12 +50,10 @@ func LdapAuthenticate(ldapConfig LdapConfig, username, password string) bool {
 
 	res, err := conn.Search(searchReq)
 	if err != nil {
-		log.Println("LDAP search error:", err)
 		return false
 	}
 
 	if len(res.Entries) == 0 {
-		log.Println("LDAP user not found:", username)
 		return false
 	}
 
@@ -64,10 +62,8 @@ func LdapAuthenticate(ldapConfig LdapConfig, username, password string) bool {
 	// 4) BIND AS USER TO VERIFY PASSWORD
 	err = conn.Bind(userDN, password)
 	if err != nil {
-		log.Println("LDAP user bind failed:", err)
 		return false
 	}
 
-	log.Println("LDAP authentication OK for:", username)
 	return true
 }

@@ -1,6 +1,6 @@
 package config
 
-import tlsconfig "ztunnel/utils/tls"
+import tlsconfig "ztunnel/utils/tls_helper"
 
 type ServerConfig struct {
 	ServerConfig ServerGeneralConfig `yaml:"serverConfig"`
