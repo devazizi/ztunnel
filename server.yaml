@@ -1,0 +1,13 @@
+serverConfig:
+  listen: 0.0.0.0:8443
+  ldapServerAddress: # ldap address
+  ldapBaseDN: # ldap base DN
+  ldapAdminDN: # ldap admin DN
+  ldapAdminPassword: #ldap admin password
+
+  rbac:
+    enabled: true
+tls:
+  cert:
+  key:
+  ca:

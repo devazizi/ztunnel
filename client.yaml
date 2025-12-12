@@ -1,0 +1,13 @@
+serverConf:
+  serverAddress: ztunnel.example.com
+  username:  #ldap username
+  password: # client ldap password
+  portForwards:
+    - listen: 127.0.0.1:1443
+      remote: localhost:8080
+    - listen: 127.0.0.1:5000
+      remote: postgres.prod.svc.cluster.local:5432
+tls:
+  cert:
+  key:
+  ca:
