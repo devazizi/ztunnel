@@ -1,99 +1,73 @@
-package ldapconn
+package ldapauth
 
 import (
-	"crypto/tls"
 	"fmt"
-	"time"
+	"log"
 
 	"github.com/go-ldap/ldap/v3"
 )
 
-// Config holds LDAP connection settings
-type Config struct {
-	URL      string
-	BaseDN   string
-	AdminDN  string
-	AdminPwd string
-	UseTLS   bool
+// ===========================
+// Singleton Config
+// ===========================
+
+type LdapConfig struct {
+	ServerAddress   string // e.g., "ldap://127.0.0.1:389"
+	BaseDN          string // e.g., "dc=ztunnel,dc=local"
+	AdminDN         string // e.g., "cn=admin,dc=ztunnel,dc=local"
+	AdminPassword   string
+	UserSearchField string // usually "uid" or "cn"
 }
 
-// LDAPClient wraps the connection
-type LDAPClient struct {
-	cfg  Config
-	conn *ldap.Conn
-}
+func LdapAuthenticate(ldapConfig LdapConfig, username, password string) bool {
+	Cfg := ldapConfig
 
-// NewLDAPClient creates a new client but does not connect yet
-func NewLDAPClient(cfg Config) *LDAPClient {
-	return &LDAPClient{cfg: cfg}
-}
-
-// Connect establishes connection to LDAP server
-func (c *LDAPClient) Connect() error {
-	var conn *ldap.Conn
-	var err error
-
-	if c.cfg.UseTLS {
-		conn, err = ldap.DialURL(c.cfg.URL, ldap.DialWithTLSConfig(&tls.Config{InsecureSkipVerify: true}))
-	} else {
-		conn, err = ldap.DialURL(c.cfg.URL)
-	}
+	// 1) CONNECT
+	conn, err := ldap.DialURL(Cfg.ServerAddress)
 	if err != nil {
-		return fmt.Errorf("failed to connect LDAP: %v", err)
+		log.Println("LDAP connect error:", err)
+		return false
+	}
+	defer conn.Close()
+
+	// 2) BIND AS ADMIN
+	err = conn.Bind(Cfg.AdminDN, Cfg.AdminPassword)
+	if err != nil {
+		log.Println("LDAP admin bind error:", err)
+		return false
 	}
 
-	// Set timeout
-	conn.SetTimeout(5 * time.Second)
-
-	c.conn = conn
-	return nil
-}
-
-// Close connection
-func (c *LDAPClient) Close() {
-	if c.conn != nil {
-		c.conn.Close()
-	}
-}
-
-// Authenticate checks user credentials against LDAP
-func (c *LDAPClient) Authenticate(username, password string) (bool, error) {
-	if c.conn == nil {
-		if err := c.Connect(); err != nil {
-			return false, err
-		}
-		defer c.Close()
-	}
-
-	// Step 1: Bind as admin to search user
-	if err := c.conn.Bind(c.cfg.AdminDN, c.cfg.AdminPwd); err != nil {
-		return false, fmt.Errorf("admin bind failed: %v", err)
-	}
-
-	// Step 2: Search for user DN
-	searchRequest := ldap.NewSearchRequest(
-		c.cfg.BaseDN,
+	// 3) SEARCH FOR USER DN
+	searchReq := ldap.NewSearchRequest(
+		Cfg.BaseDN,
 		ldap.ScopeWholeSubtree,
 		ldap.NeverDerefAliases,
-		0,
-		0,
-		false,
-		fmt.Sprintf("(uid=%s)", ldap.EscapeFilter(username)),
+		0, 0, false,
+		fmt.Sprintf("(%s=%s)", Cfg.UserSearchField, username),
 		[]string{"dn"},
 		nil,
 	)
 
-	res, err := c.conn.Search(searchRequest)
-	if err != nil || len(res.Entries) == 0 {
-		return false, fmt.Errorf("user not found")
+	res, err := conn.Search(searchReq)
+	if err != nil {
+		log.Println("LDAP search error:", err)
+		return false
+	}
+
+	if len(res.Entries) == 0 {
+		log.Println("LDAP user not found:", username)
+		return false
 	}
 
 	userDN := res.Entries[0].DN
 
-	// Step 3: Bind with user DN + password
-	if err := c.conn.Bind(userDN, password); err != nil {
-		return false, fmt.Errorf("invalid credentials")
+	// 4) BIND AS USER TO VERIFY PASSWORD
+	err = conn.Bind(userDN, password)
+	if err != nil {
+		log.Println("LDAP user bind failed:", err)
+		return false
 	}
 
-	return true, nil
+	log.Println("LDAP authentication OK for:", username)
+	return true
 }

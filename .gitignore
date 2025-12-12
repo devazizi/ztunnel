@@ -33,4 +33,4 @@ go.work.sum
 cert.yaml
 server-cert.yaml
 client-cert.yaml
-./certs
+certs

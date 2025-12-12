@@ -6,11 +6,12 @@ import (
 	"io"
 	"log"
 	"net"
-	"ztunnel/utils"
+	"time"
+
+	"ztunnel/utils/config"
 	tlsUtils "ztunnel/utils/tls"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
 /*
@@ -40,7 +41,7 @@ import (
  ├───────────┬────────────────┤
  │ EOF/Error │ Normal Data    │
  ▼           ▼
-Close Local  Encrypt + Send over Tunnel
+Close Local  Send over Tunnel (plaintext)
 Connection   │
              ▼
    ┌─────────────────────┐
@@ -48,77 +49,70 @@ Connection   │
    ├───────────┬─────────┤
    │ Error     │ Success │
    ▼           ▼
-Reconnect    Decrypt & Lookup connID
-Tunnel      │
-            ▼
-    Write to Local Connection
-            │
-            ▼
-       Increment Sequence
-            │
-            ▼
-      Continue Reading
-
+Reconnect    Write to Local Connection
+Tunnel
 */
 
 func main() {
-
-	listen := flag.String("listen", "", "local port to listen on")
-	remote := flag.String("remote", "", "remote host:port to forward to")
-	server := flag.String("server", "", "ztunnel server host:port to forward to")
-	tlsCertificatePath := flag.String("tls-certificate-conf", "", "path to TLS certificate")
-	sharedKey := flag.String("shared-key", "", "path to shared key")
+	configFilePath := flag.String("config", "ztunnel-client-config.yaml", "ztunnel client config file")
 	flag.Parse()
 
-	if *remote == "" || *tlsCertificatePath == "" || *listen == "" || *sharedKey == "" {
-		fmt.Println("Error: --remote, --listen, --tls-certificate-conf, --sharedKey are required")
+	if *configFilePath == "" {
+		flag.Usage()
 		return
 	}
 
-	fmt.Println("Listening on port:", *listen)
-	fmt.Println("Forwarding to remote:", *remote)
+	var clientCfg config.ClientConfig
+	if err := config.LoadYAMLConfig(*configFilePath, &clientCfg); err != nil {
+		log.Fatal(err)
+	}
 
-	tlsConfig, err := tlsUtils.LoadClientTLSConfig(*tlsCertificatePath)
-
+	tlsConfig, err := tlsUtils.LoadClientTLSConfig(clientCfg.TLS)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
 	dialer := websocket.Dialer{TLSClientConfig: tlsConfig}
-	//fmt.Println(fmt.Sprintf("wss://%v/ws", *server)) // debug ztunnel server address
-	conn, _, err := dialer.Dial(fmt.Sprintf("wss://%v/ws", *server), nil)
-	if err != nil {
-		panic(err)
-	}
-	defer conn.Close()
 
+	// Dial loop: keep trying until connected
+	var wsConn *websocket.Conn
 	for {
-		conn, _, err = dialer.Dial(fmt.Sprintf("wss://%v/ws", *server), nil)
+		conn, _, err := dialer.Dial(fmt.Sprintf("wss://%v/ws", clientCfg.ServerConf.ServerAddress), nil)
 		if err != nil {
-			log.Println("WebSocket dial failed, retrying...", err)
+			log.Println("WebSocket dial failed, retrying in 2s...", err)
+			time.Sleep(2 * time.Second)
 			continue
 		}
+		wsConn = conn
 		log.Println("Connected to server")
 		break
 	}
-	defer conn.Close()
+	if wsConn == nil {
+		log.Fatal("failed to establish websocket connection")
+	}
+	defer wsConn.Close()
 
-	key := []byte(*sharedKey)
-	aead, err := chacha20poly1305.New(key)
-	if err != nil {
-		panic(err)
+	// Example: listen on local port from first port-forward entry
+	if len(clientCfg.ServerConf.PortForwards) == 0 {
+		log.Fatal("no port forwards configured")
 	}
 
-	seqOut := uint64(0)
-	seqIn := uint64(0)
+	listenAddr := clientCfg.ServerConf.PortForwards[0].Listen
+	remote := clientCfg.ServerConf.PortForwards[0].Remote
 
-	// Example: listen on local port 8080
-	listener, err := net.Listen("tcp", *listen)
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		panic(err)
+		log.Fatalf("failed to listen on %s: %v", listenAddr, err)
 	}
 	defer listener.Close()
-	log.Println(fmt.Sprintf("Client listening on %v", *listen))
+	log.Printf("Client listening on %v, forwarding to %v", listenAddr, remote)
+
+	// 1) SEND AUTH ONLY ONCE
+	authPayload := []byte(fmt.Sprintf("%s:::%s\n", clientCfg.ServerConf.Username, clientCfg.ServerConf.Password))
+	if err := wsConn.WriteMessage(websocket.BinaryMessage, authPayload); err != nil {
+		log.Println("send credentials failed:", err)
+		return
+	}
 
 	for {
 		localConn, err := listener.Accept()
@@ -127,59 +121,49 @@ func main() {
 			continue
 		}
 
-		go func(c net.Conn, remote string) {
+		go func(c net.Conn, remoteAddr string, ws *websocket.Conn) {
 			defer c.Close()
+
+			// 2) SEND REMOTE ADDRESS ONLY ONCE
+			remoteHeader := []byte(remoteAddr + "\n")
+			if err := ws.WriteMessage(websocket.BinaryMessage, remoteHeader); err != nil {
+				log.Println("send remote address failed:", err)
+				return
+			}
+
 			buf := make([]byte, 4096)
 
 			for {
 				n, err := c.Read(buf)
 				if err != nil {
 					if err != io.EOF {
-						log.Println("Read error:", err)
+						log.Println("local read error:", err)
 					}
-					break
+					return
 				}
 
-				payload := append([]byte(remote+"\n"), buf[:n]...)
-				nonce, ct, err := utils.Encrypt(aead, seqOut, payload)
-				if err != nil {
-					log.Println("Encrypt failed:", err)
-					break
-				}
-				seqOut++
+				// 3) TUNNEL ONLY PAYLOAD (NO AUTH, NO REMOTE ADDR)
+				payload := buf[:n]
 
-				err = conn.WriteMessage(websocket.BinaryMessage, append(nonce, ct...))
-				if err != nil {
-					log.Println("Write to server failed:", err)
-					break
+				if err := ws.WriteMessage(websocket.BinaryMessage, payload); err != nil {
+					log.Println("write to server failed:", err)
+					return
 				}
 
-				// Read server response
-				_, msg, err := conn.ReadMessage()
+				// 4) WAIT FOR SERVER RESPONSE
+				_, msg, err := ws.ReadMessage()
 				if err != nil {
-					log.Println("Server read error:", err)
-					break
-				}
-				if len(msg) < utils.NonceSize {
-					log.Println("Response too short")
-					break
+					log.Println("server read error:", err)
+					return
 				}
 
-				respNonce := msg[:utils.NonceSize]
-				respCT := msg[utils.NonceSize:]
-				pt, err := utils.Decrypt(aead, seqIn, respNonce, respCT)
+				// 5) SEND BACK TO LOCAL
+				_, err = c.Write(msg)
 				if err != nil {
-					log.Println("Decrypt failed:", err)
-					break
-				}
-				seqIn++
-
-				_, err = c.Write(pt)
-				if err != nil {
-					log.Println("Write to local connection failed:", err)
-					break
+					log.Println("local write error:", err)
+					return
 				}
 			}
-		}(localConn, *remote)
+		}(localConn, remote, wsConn)
 	}
 }
