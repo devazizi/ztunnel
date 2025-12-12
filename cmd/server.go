@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -93,12 +94,12 @@ func main() {
 		UserSearchField: "cn",
 	}
 
-	listener, err := tls.Listen("tcp", ":8443", tlsConfig)
+	listener, err := tls.Listen("tcp", serverCfg.ServerConfig.Listen, tlsConfig)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer listener.Close()
-	logger.Println("Server listening on :8443")
+	logger.Println(fmt.Sprintf("Server listening on %s", serverCfg.ServerConfig.Listen))
 
 	for {
 		conn, err := listener.Accept()
